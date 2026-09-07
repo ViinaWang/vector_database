@@ -1,0 +1,33 @@
+[package]
+name = "vectordb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Embedded vector database core: storage, WAL, segments, flat search"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+roaring = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs4 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "kernel"
+harness = false
+
+[[bench]]
+name = "flat"
+harness = false
+
+[lints]
+workspace = true
