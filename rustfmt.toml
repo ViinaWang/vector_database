@@ -1,0 +1,3 @@
+# Deliberately close to rustfmt defaults. No project-specific style rules;
+# formatting arguments are not worth having.
+edition = "2024"

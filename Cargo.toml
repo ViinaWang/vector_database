@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/server",
+    "crates/cli",
+    "crates/wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/vectordb"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+crc32fast = "1"
+roaring = "0.10"
+fs4 = "0.13"
+tempfile = "3"
+criterion = "0.7"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+clap = { version = "4", features = ["derive"] }
+wasm-bindgen = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
