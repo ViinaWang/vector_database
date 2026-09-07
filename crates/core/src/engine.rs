@@ -14,16 +14,17 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use serde_json::Value;
 
-use crate::collection::CollectionConfig;
+use crate::collection::{CollectionConfig, IndexKind};
 use crate::error::{Error, Result};
 use crate::filter::Condition;
 use crate::id::ExternalId;
 use crate::index::flat;
+use crate::index::hnsw::HnswIndex;
 use crate::kernel::Metric;
 use crate::manifest::{CollectionEntry, Manifest};
 use crate::query::{Query, ScoredPoint, ScrollPage};
 use crate::segment::Point;
-use crate::segment::immutable::{ImmutableSegment, SegmentData};
+use crate::segment::immutable::{ImmutableSegment, REBUILD_TOMBSTONE_RATIO};
 use crate::segment::mutable::MutableSegment;
 use crate::storage::{Fs, memory::MemoryFs};
 use crate::wal::{Op, Wal, WalRecord};
@@ -148,7 +149,11 @@ impl Database {
             let mut immutables = Vec::new();
             for seg_id in &entry.segments {
                 let dir = segs_dir.join(format!("seg-{seg_id}"));
-                immutables.push(Arc::new(ImmutableSegment::open(fs.clone(), &dir)?));
+                immutables.push(Arc::new(ImmutableSegment::open(
+                    fs.clone(),
+                    &dir,
+                    entry.config.metric,
+                )?));
             }
             coll_specs.push((entry.name.clone(), entry.config.clone(), immutables));
         }
@@ -517,15 +522,7 @@ impl Collection {
                 }
                 filter_pass(q.filter.as_ref(), id, imm.payload_of(idx as usize).as_ref())
             };
-            for (idx, score) in flat::search(
-                metric,
-                imm.vectors(),
-                imm.norms(),
-                dim,
-                &query_vec,
-                Some(&pass),
-                q.top_k,
-            ) {
+            for (idx, score) in imm.search(&query_vec, q.top_k, Some(&pass)) {
                 hits.push((score, idx, Loc::Imm(si)));
             }
         }
@@ -781,30 +778,43 @@ fn apply_upsert(db: &Arc<DbInner>, coll: &Arc<CollInner>, points: &[Point]) -> R
     Ok(need)
 }
 
-fn apply_delete(_db: &Arc<DbInner>, coll: &Arc<CollInner>, ids: &[ExternalId]) -> Result<usize> {
-    let mut view = coll.view.write().map_err(poison)?;
-    let mut deleted = 0usize;
-    let mut tombs: Vec<(usize, Vec<u32>)> = Vec::new();
-    for id in ids {
-        if view.mutable.delete(id) {
-            deleted += 1;
-            continue;
-        }
-        // 可变段没有（或已删）: 找不可变段。至多一个存活（写路径不变量）。
-        for (si, imm) in view.immutables.iter().enumerate() {
-            if let Some(idx) = imm.alive_index(id) {
-                if let Some(slot) = tombs.iter_mut().find(|(s, _)| *s == si) {
-                    slot.1.push(idx);
-                } else {
-                    tombs.push((si, vec![idx]));
-                }
+fn apply_delete(db: &Arc<DbInner>, coll: &Arc<CollInner>, ids: &[ExternalId]) -> Result<usize> {
+    let mut rebuild: Vec<usize> = Vec::new();
+    let deleted = {
+        let mut view = coll.view.write().map_err(poison)?;
+        let mut deleted = 0usize;
+        let mut tombs: Vec<(usize, Vec<u32>)> = Vec::new();
+        for id in ids {
+            if view.mutable.delete(id) {
                 deleted += 1;
-                break;
+                continue;
+            }
+            // 可变段没有（或已删）: 找不可变段。至多一个存活（写路径不变量）。
+            for (si, imm) in view.immutables.iter().enumerate() {
+                if let Some(idx) = imm.alive_index(id) {
+                    if let Some(slot) = tombs.iter_mut().find(|(s, _)| *s == si) {
+                        slot.1.push(idx);
+                    } else {
+                        tombs.push((si, vec![idx]));
+                    }
+                    deleted += 1;
+                    break;
+                }
             }
         }
-    }
-    for (si, idxs) in tombs {
-        view.immutables[si].tombstone_many(&idxs)?;
+        for (si, idxs) in tombs {
+            view.immutables[si].tombstone_many(&idxs)?;
+        }
+        // 墓碑占比超阈值的段: 遍历浪费已成规模，值得就地重建。
+        for (si, imm) in view.immutables.iter().enumerate() {
+            if imm.tombstone_ratio() > REBUILD_TOMBSTONE_RATIO {
+                rebuild.push(si);
+            }
+        }
+        deleted
+    };
+    for si in rebuild {
+        rebuild_segment_locked(db, coll, si)?;
     }
     Ok(deleted)
 }
@@ -888,11 +898,17 @@ fn flush_locked(db: &Arc<DbInner>) -> Result<()> {
             db.fs.as_ref(),
             &tmp,
             seg_id,
-            coll.config.dim,
-            &SegmentData::from(&view.mutable),
+            view.mutable.core(),
+            view.mutable.deleted(),
+            None,
         )?;
         db.fs.rename(&tmp, &final_dir)?;
-        let seg = Arc::new(ImmutableSegment::open(db.fs.clone(), &final_dir)?);
+        let seg = Arc::new(ImmutableSegment::open(
+            db.fs.clone(),
+            &final_dir,
+            coll.config.metric,
+        )?);
+        build_segment_index(&coll.config, &seg)?;
         staged.push((name.clone(), seg_id, seg));
     }
     if staged.is_empty() {
@@ -961,11 +977,18 @@ fn compact_locked(db: &Arc<DbInner>, coll: &Arc<CollInner>) -> Result<()> {
                 db.fs.as_ref(),
                 &tmp,
                 seg_id,
-                dim,
-                &SegmentData::from(&merged),
+                merged.core(),
+                merged.deleted(),
+                None,
             )?;
             db.fs.rename(&tmp, &final_dir)?;
-            new_seg = Some(Arc::new(ImmutableSegment::open(db.fs.clone(), &final_dir)?));
+            let seg = Arc::new(ImmutableSegment::open(
+                db.fs.clone(),
+                &final_dir,
+                coll.config.metric,
+            )?);
+            build_segment_index(&coll.config, &seg)?;
+            new_seg = Some(seg);
             view.immutables = new_seg.clone().into_iter().collect();
             view.mutable.clear();
         }
@@ -982,5 +1005,82 @@ fn compact_locked(db: &Arc<DbInner>, coll: &Arc<CollInner>) -> Result<()> {
     for id in old_ids {
         let _ = db.fs.remove_dir_all(&seg_dir(&db.root, id));
     }
+    Ok(())
+}
+
+/// 按集合配置为不可变段构建 ANN 索引并安装。flush/compact/单段重建共用。
+fn build_segment_index(config: &CollectionConfig, seg: &Arc<ImmutableSegment>) -> Result<()> {
+    if let IndexKind::Hnsw { params } = &config.index {
+        let idx = HnswIndex::build(seg.core(), config.metric, params.clone())?;
+        let bytes = idx.serialize();
+        seg.install_index(Arc::new(idx), Some(bytes))?;
+    }
+    Ok(())
+}
+
+/// 单段就地重建: 只保留存活行（覆盖层固化进新段），原子替换 manifest。
+/// 与 compact 的区别是不合并全部段，只处理墓碑读放大已劣化的那一个。
+/// 调用方持有 write_mu。
+fn rebuild_segment_locked(db: &Arc<DbInner>, coll: &Arc<CollInner>, si: usize) -> Result<()> {
+    let old_id: u64;
+    let new_seg: Option<Arc<ImmutableSegment>>;
+    {
+        let mut view = coll.view.write().map_err(poison)?;
+        let Some(old) = view.immutables.get(si).cloned() else {
+            return Ok(());
+        };
+        let mut merged = MutableSegment::new(coll.config.dim);
+        for idx in 0..old.total() as u32 {
+            if old.is_alive(idx) {
+                merged.upsert(&old.point(idx)); // point() 已应用覆盖层
+            }
+        }
+        old_id = old.seg_id;
+
+        if merged.is_empty() {
+            new_seg = None;
+            view.immutables.remove(si);
+        } else {
+            let seg_id = db.next_seg_id.fetch_add(1, Ordering::SeqCst);
+            let tmp = seg_dir(&db.root, seg_id).with_extension("tmp");
+            let final_dir = seg_dir(&db.root, seg_id);
+            db.fs.create_dir_all(&tmp)?;
+            ImmutableSegment::write_new(
+                db.fs.as_ref(),
+                &tmp,
+                seg_id,
+                merged.core(),
+                merged.deleted(),
+                None,
+            )?;
+            db.fs.rename(&tmp, &final_dir)?;
+            let seg = Arc::new(ImmutableSegment::open(
+                db.fs.clone(),
+                &final_dir,
+                coll.config.metric,
+            )?);
+            build_segment_index(&coll.config, &seg)?;
+            new_seg = Some(seg.clone());
+            view.immutables[si] = seg;
+        }
+    }
+    {
+        let mut mf = db.manifest.lock().map_err(poison)?;
+        let entry = mf
+            .entry_mut(&coll.name)
+            .ok_or_else(|| Error::CollectionNotFound(coll.name.clone()))?;
+        match &new_seg {
+            Some(s) => {
+                if let Some(pos) = entry.segments.iter().position(|&x| x == old_id) {
+                    entry.segments[pos] = s.seg_id;
+                } else {
+                    entry.segments.push(s.seg_id);
+                }
+            }
+            None => entry.segments.retain(|&x| x != old_id),
+        }
+        mf.save(db.fs.as_ref(), &db.root)?;
+    }
+    let _ = db.fs.remove_dir_all(&seg_dir(&db.root, old_id));
     Ok(())
 }

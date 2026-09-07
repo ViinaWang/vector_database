@@ -100,16 +100,21 @@ pub fn norm(a: &[f32]) -> f32 {
 }
 
 /// 按度量计算分值。cosine 需要 b 的范数（段内预计算）; 任一范数为 0 时返回 0。
+/// 热路径请用 [`score_with`]（预计算查询范数），本函数每行都会重算 a 的范数。
 pub fn score(metric: Metric, a: &[f32], b: &[f32], b_norm: f32) -> f32 {
+    score_with(metric, a, norm(a), b, b_norm)
+}
+
+/// 同 [`score`]，但调用方预计算 a 的范数（扫描/图遍历每查询只算一次）。
+pub fn score_with(metric: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> f32 {
     match metric {
         Metric::L2 => l2_sq(a, b),
         Metric::Dot => dot(a, b),
         Metric::Cosine => {
-            let an = norm(a);
-            if an == 0.0 || b_norm == 0.0 {
+            if a_norm == 0.0 || b_norm == 0.0 {
                 0.0
             } else {
-                dot(a, b) / (an * b_norm)
+                dot(a, b) / (a_norm * b_norm)
             }
         }
     }

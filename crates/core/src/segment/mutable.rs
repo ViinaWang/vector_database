@@ -1,5 +1,8 @@
 //! 内存可变段。所有写入先到这里，flush 时固化为不可变段。
 //! 覆盖写复用原行（内部序号不变），删除打墓碑。
+//! 可变段不做 ANN 索引——其规模受自动 flush 阈值约束，精确扫描即可。
+
+use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
 use serde_json::Value;
@@ -7,16 +10,13 @@ use serde_json::Value;
 use crate::id::ExternalId;
 use crate::kernel;
 use crate::segment::Point;
+use crate::segment::core::SegmentCore;
 
 /// 内存可变段。
 pub struct MutableSegment {
-    dim: usize,
-    vectors: Vec<f32>,
-    norms: Vec<f32>,
-    ids: Vec<ExternalId>,
-    payloads: Vec<Option<Value>>,
+    core: SegmentCore,
     payload_bytes: usize,
-    ext2int: std::collections::HashMap<ExternalId, u32>,
+    ext2int: HashMap<ExternalId, u32>,
     deleted: RoaringBitmap,
 }
 
@@ -24,46 +24,53 @@ impl MutableSegment {
     /// 新建空段。dim 来自集合配置。
     pub fn new(dim: usize) -> Self {
         MutableSegment {
-            dim,
-            vectors: Vec::new(),
-            norms: Vec::new(),
-            ids: Vec::new(),
-            payloads: Vec::new(),
+            core: SegmentCore {
+                dim,
+                vectors: Vec::new(),
+                norms: Vec::new(),
+                ids: Vec::new(),
+                payloads: Vec::new(),
+            },
             payload_bytes: 0,
-            ext2int: std::collections::HashMap::new(),
+            ext2int: HashMap::new(),
             deleted: RoaringBitmap::new(),
         }
     }
 
     /// 向量维度。
     pub fn dim(&self) -> usize {
-        self.dim
+        self.core.dim
+    }
+
+    /// 数据主体（写段/建索引用）。
+    pub fn core(&self) -> &SegmentCore {
+        &self.core
     }
 
     /// 插入或覆盖一个点（同 ID 覆盖并复活）。
     pub fn upsert(&mut self, p: &Point) {
         if let Some(&idx) = self.ext2int.get(&p.id) {
-            let idx = idx as usize;
-            let start = idx * self.dim;
-            self.vectors[start..start + self.dim].copy_from_slice(&p.vector);
-            self.norms[idx] = kernel::norm(&p.vector);
-            if let Some(old) = &self.payloads[idx] {
+            let i = idx as usize;
+            let start = i * self.core.dim;
+            self.core.vectors[start..start + self.core.dim].copy_from_slice(&p.vector);
+            self.core.norms[i] = kernel::norm(&p.vector);
+            if let Some(old) = &self.core.payloads[i] {
                 self.payload_bytes -= old.to_string().len();
             }
             if let Some(new) = &p.payload {
                 self.payload_bytes += new.to_string().len();
             }
-            self.payloads[idx] = p.payload.clone();
-            self.deleted.remove(idx as u32);
+            self.core.payloads[i] = p.payload.clone();
+            self.deleted.remove(idx);
         } else {
-            let idx = self.ids.len() as u32;
-            self.vectors.extend_from_slice(&p.vector);
-            self.norms.push(kernel::norm(&p.vector));
-            self.ids.push(p.id.clone());
+            let idx = self.core.ids.len() as u32;
+            self.core.vectors.extend_from_slice(&p.vector);
+            self.core.norms.push(kernel::norm(&p.vector));
+            self.core.ids.push(p.id.clone());
             if let Some(v) = &p.payload {
                 self.payload_bytes += v.to_string().len();
             }
-            self.payloads.push(p.payload.clone());
+            self.core.payloads.push(p.payload.clone());
             self.ext2int.insert(p.id.clone(), idx);
         }
     }
@@ -83,14 +90,14 @@ impl MutableSegment {
     pub fn set_payload(&mut self, id: &ExternalId, payload: Option<Value>) -> bool {
         match self.ext2int.get(id) {
             Some(&idx) if !self.deleted.contains(idx) => {
-                let idx = idx as usize;
-                if let Some(old) = &self.payloads[idx] {
+                let i = idx as usize;
+                if let Some(old) = &self.core.payloads[i] {
                     self.payload_bytes -= old.to_string().len();
                 }
                 if let Some(new) = &payload {
                     self.payload_bytes += new.to_string().len();
                 }
-                self.payloads[idx] = payload;
+                self.core.payloads[i] = payload;
                 true
             }
             _ => false,
@@ -116,38 +123,42 @@ impl MutableSegment {
     pub fn point(&self, idx: u32) -> Point {
         let i = idx as usize;
         Point {
-            id: self.ids[i].clone(),
-            vector: self.vectors[i * self.dim..(i + 1) * self.dim].to_vec(),
-            payload: self.payloads[i].clone(),
+            id: self.core.ids[i].clone(),
+            vector: self.core.vector(idx).to_vec(),
+            payload: self.core.payloads[i].clone(),
         }
     }
 
     /// 是否完全为空（无任何行）。
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.core.ids.is_empty()
     }
 
     /// 总行数（含墓碑）。
     pub fn total(&self) -> usize {
-        self.ids.len()
+        self.core.ids.len()
     }
 
     /// 存活行数。
     pub fn alive(&self) -> u64 {
-        self.ids.len() as u64 - self.deleted.len()
+        self.core.ids.len() as u64 - self.deleted.len()
     }
 
     /// 近似内存占用（向量 + payload），供自动 flush 阈值用。
     pub fn approx_bytes(&self) -> u64 {
-        (self.vectors.len() * 4 + self.payload_bytes) as u64
+        (self.core.vectors.len() * 4 + self.payload_bytes) as u64
     }
 
     /// 清空。flush 交换后调用。
     pub fn clear(&mut self) {
-        self.vectors.clear();
-        self.norms.clear();
-        self.ids.clear();
-        self.payloads.clear();
+        let dim = self.core.dim;
+        self.core = SegmentCore {
+            dim,
+            vectors: Vec::new(),
+            norms: Vec::new(),
+            ids: Vec::new(),
+            payloads: Vec::new(),
+        };
         self.payload_bytes = 0;
         self.ext2int.clear();
         self.deleted.clear();
@@ -156,19 +167,19 @@ impl MutableSegment {
     // 供 flat 扫描与段固化读取。
     /// 扁平向量存储。
     pub fn vectors(&self) -> &[f32] {
-        &self.vectors
+        &self.core.vectors
     }
     /// 预计算范数，与向量行对齐。
     pub fn norms(&self) -> &[f32] {
-        &self.norms
+        &self.core.norms
     }
     /// ID 列表。
     pub fn ids(&self) -> &[ExternalId] {
-        &self.ids
+        &self.core.ids
     }
     /// payload 列表。
     pub fn payloads(&self) -> &[Option<Value>] {
-        &self.payloads
+        &self.core.payloads
     }
     /// 墓碑位图。
     pub fn deleted(&self) -> &RoaringBitmap {

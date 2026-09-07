@@ -8,12 +8,16 @@
 //! - `payloads.jsonl`       每行一个 payload（或 null）
 //! - `dels.bin`             墓碑 roaring bitmap（按需创建）
 //! - `payloads.overlay.jsonl`  payload 覆盖层（按需创建）
+//! - `index.bin`            ANN 索引持久化（按需; flat 段无此文件）
 //!
+//! 段数据在内存中为 `Arc<SegmentCore>`，与 ANN 索引共享。
+//! 索引槽位是 `RwLock<Arc<dyn AnnIndex>>`：加载时默认 flat，
+//! flush/compact 后可换入 hnsw（重建亦然），读侧拿 Arc 快照无锁检索。
 //! 边车用 tmp+rename 原子替换; 打开时全量载入内存。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -21,8 +25,10 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::id::ExternalId;
+use crate::index::FlatIndex;
+use crate::kernel::Metric;
 use crate::segment::Point;
-use crate::segment::mutable::MutableSegment;
+use crate::segment::core::SegmentCore;
 use crate::storage::{Fs, atomic_write};
 
 const META: &str = "meta.json";
@@ -32,6 +38,11 @@ const IDS: &str = "ids.jsonl";
 const PAYLOADS: &str = "payloads.jsonl";
 const DELS: &str = "dels.bin";
 const OVERLAY: &str = "payloads.overlay.jsonl";
+/// ANN 索引持久化文件名。
+pub const INDEX_FILE: &str = "index.bin";
+
+/// 墓碑占比超过该值的不可变段建议重建。
+pub const REBUILD_TOMBSTONE_RATIO: f32 = 0.30;
 
 #[derive(Serialize, Deserialize)]
 struct Meta {
@@ -44,96 +55,70 @@ struct Meta {
 pub struct ImmutableSegment {
     /// 段 ID（目录名后缀，全局唯一）。
     pub seg_id: u64,
-    dim: usize,
-    vectors: Vec<f32>,
-    norms: Vec<f32>,
-    ids: Vec<ExternalId>,
-    payloads: Vec<Option<Value>>,
+    core: Arc<SegmentCore>,
     ext2int: HashMap<ExternalId, u32>,
     dir: PathBuf,
-    fs: std::sync::Arc<dyn Fs>,
+    fs: Arc<dyn Fs>,
     deleted: RwLock<RoaringBitmap>,
     overlay: RwLock<HashMap<ExternalId, Option<Value>>>,
-}
-
-/// 写段前的输入快照（从可变段或合并结果借用）。
-pub struct SegmentData<'a> {
-    /// 扁平向量。
-    pub vectors: &'a [f32],
-    /// 预计算范数。
-    pub norms: &'a [f32],
-    /// ID 列表。
-    pub ids: &'a [ExternalId],
-    /// payload 列表。
-    pub payloads: &'a [Option<Value>],
-    /// 墓碑（固化时直接带入）。
-    pub deleted: &'a RoaringBitmap,
-    /// payload 覆盖层（压实时带入; 可变段来源时为 None）。
-    pub overlay: Option<&'a HashMap<ExternalId, Option<Value>>>,
-}
-
-impl<'a> From<&'a MutableSegment> for SegmentData<'a> {
-    fn from(m: &'a MutableSegment) -> Self {
-        SegmentData {
-            vectors: m.vectors(),
-            norms: m.norms(),
-            ids: m.ids(),
-            payloads: m.payloads(),
-            deleted: m.deleted(),
-            overlay: None,
-        }
-    }
+    index: RwLock<Arc<dyn crate::index::AnnIndex>>,
 }
 
 impl ImmutableSegment {
     /// 将数据写入 `dir`（调用方负责先 create_dir_all，建议指向 `seg-<id>.tmp`，
-    /// 成功后由调用方 rename 到正式目录）。写入即含初始墓碑（可变段带来的）。
+    /// 成功后由调用方 rename 到正式目录）。
     pub fn write_new(
         fs: &dyn Fs,
         dir: &Path,
         seg_id: u64,
-        dim: usize,
-        data: &SegmentData<'_>,
+        core: &SegmentCore,
+        deleted: &RoaringBitmap,
+        overlay: Option<&HashMap<ExternalId, Option<Value>>>,
     ) -> Result<()> {
-        let count = data.ids.len();
+        let count = core.ids.len();
         atomic_write(
             fs,
             &dir.join(META),
-            serde_json::to_vec(&Meta { seg_id, dim, count })?.as_slice(),
+            serde_json::to_vec(&Meta {
+                seg_id,
+                dim: core.dim,
+                count,
+            })?
+            .as_slice(),
         )?;
 
-        let mut vbytes = Vec::with_capacity(data.vectors.len() * 4);
-        for v in data.vectors {
+        let mut vbytes = Vec::with_capacity(core.vectors.len() * 4);
+        for v in &core.vectors {
             vbytes.extend_from_slice(&v.to_le_bytes());
         }
         atomic_write(fs, &dir.join(VECTORS), &vbytes)?;
 
-        let mut nbytes = Vec::with_capacity(data.norms.len() * 4);
-        for n in data.norms {
+        let mut nbytes = Vec::with_capacity(core.norms.len() * 4);
+        for n in &core.norms {
             nbytes.extend_from_slice(&n.to_le_bytes());
         }
         atomic_write(fs, &dir.join(NORMS), &nbytes)?;
 
         let mut ids = String::new();
-        for id in data.ids {
+        for id in &core.ids {
             ids.push_str(&serde_json::to_string(id)?);
             ids.push('\n');
         }
         atomic_write(fs, &dir.join(IDS), ids.as_bytes())?;
 
         let mut pls = String::new();
-        for p in data.payloads {
+        for p in &core.payloads {
             pls.push_str(&serde_json::to_string(p)?);
             pls.push('\n');
         }
         atomic_write(fs, &dir.join(PAYLOADS), pls.as_bytes())?;
 
-        if !data.deleted.is_empty() {
+        if !deleted.is_empty() {
             let mut buf = Vec::new();
-            data.deleted.serialize_into(&mut buf)?;
+            deleted.serialize_into(&mut buf)?;
             atomic_write(fs, &dir.join(DELS), &buf)?;
         }
-        if let Some(ov) = data.overlay {
+        if let Some(ov) = overlay {
             if !ov.is_empty() {
                 write_overlay_file(fs, &dir.join(OVERLAY), ov)?;
             }
@@ -141,8 +126,8 @@ impl ImmutableSegment {
         Ok(())
     }
 
-    /// 从段目录载入（含边车）。
-    pub fn open(fs: std::sync::Arc<dyn Fs>, dir: &Path) -> Result<Self> {
+    /// 从段目录载入（含边车）。metric 来自集合配置，用于构造索引。
+    pub fn open(fs: Arc<dyn Fs>, dir: &Path, metric: Metric) -> Result<Self> {
         let seg_id = dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -221,19 +206,86 @@ impl ImmutableSegment {
             .map(|(i, id)| (id.clone(), i as u32))
             .collect();
 
-        Ok(ImmutableSegment {
-            seg_id,
+        let core = Arc::new(SegmentCore {
             dim: meta.dim,
             vectors,
             norms,
             ids,
             payloads,
+        });
+
+        let index: Arc<dyn crate::index::AnnIndex> = if fs.exists(&dir.join(INDEX_FILE)) {
+            let bytes = read_file(fs.as_ref(), &dir.join(INDEX_FILE))?;
+            Arc::new(crate::index::hnsw::HnswIndex::load(
+                bytes,
+                core.clone(),
+                metric,
+            )?)
+        } else {
+            Arc::new(FlatIndex::new(core.clone(), metric))
+        };
+
+        Ok(ImmutableSegment {
+            seg_id,
+            core,
             ext2int,
             dir: dir.to_path_buf(),
             fs,
             deleted: RwLock::new(deleted),
             overlay: RwLock::new(overlay),
+            index: RwLock::new(index),
         })
+    }
+
+    /// 走当前索引检索（flat 或 hnsw）。pass 语义见 [`crate::index::AnnIndex::search`]。
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        pass: Option<&dyn Fn(u32) -> bool>,
+    ) -> Vec<(u32, f32)> {
+        match self.index.read() {
+            Ok(idx) => idx.search(query, k, pass),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 换入新索引（flush/compact/重建后调用），并持久化其序列化形式。
+    pub fn install_index(
+        &self,
+        index: Arc<dyn crate::index::AnnIndex>,
+        serialized: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(bytes) = &serialized {
+            atomic_write(self.fs.as_ref(), &self.dir.join(INDEX_FILE), bytes)?;
+        }
+        match self.index.write() {
+            Ok(mut slot) => {
+                *slot = index;
+                Ok(())
+            }
+            Err(e) => Err(Error::Invalid(format!("lock poisoned: {e}"))),
+        }
+    }
+
+    /// 当前索引种类名（监控/测试用）。
+    pub fn index_kind(&self) -> &'static str {
+        self.index.read().map(|i| i.kind()).unwrap_or("flat")
+    }
+
+    /// 数据主体共享句柄（建索引用）。
+    pub fn core(&self) -> Arc<SegmentCore> {
+        self.core.clone()
+    }
+
+    /// 墓碑占比（0.0-1.0）。超过 [`REBUILD_TOMBSTONE_RATIO`] 建议重建。
+    pub fn tombstone_ratio(&self) -> f32 {
+        let total = self.core.ids.len();
+        if total == 0 {
+            return 0.0;
+        }
+        let del = self.deleted.read().map(|d| d.len()).unwrap_or(0);
+        del as f32 / total as f32
     }
 
     /// 存活内部序号。
@@ -277,8 +329,8 @@ impl ImmutableSegment {
         let i = idx as usize;
         let payload = self.payload_of(i);
         Point {
-            id: self.ids[i].clone(),
-            vector: self.vectors[i * self.dim..(i + 1) * self.dim].to_vec(),
+            id: self.core.ids[i].clone(),
+            vector: self.core.vector(idx).to_vec(),
             payload,
         }
     }
@@ -286,12 +338,12 @@ impl ImmutableSegment {
     /// 应用覆盖层后的 payload。
     pub fn payload_of(&self, i: usize) -> Option<Value> {
         if let Ok(ov) = self.overlay.read() {
-            match ov.get(&self.ids[i]) {
+            match ov.get(&self.core.ids[i]) {
                 Some(v) => v.clone(),
-                None => self.payloads[i].clone(),
+                None => self.core.payloads[i].clone(),
             }
         } else {
-            self.payloads[i].clone()
+            self.core.payloads[i].clone()
         }
     }
 
@@ -305,31 +357,31 @@ impl ImmutableSegment {
 
     /// 总行数（含墓碑）。
     pub fn total(&self) -> usize {
-        self.ids.len()
+        self.core.ids.len()
     }
 
     /// 存活行数。
     pub fn alive(&self) -> u64 {
         let del = self.deleted.read().map(|d| d.len()).unwrap_or(0);
-        self.ids.len() as u64 - del
+        self.core.ids.len() as u64 - del
     }
 
     // 供扫描/合并读取。
     /// 扁平向量存储。
     pub fn vectors(&self) -> &[f32] {
-        &self.vectors
+        &self.core.vectors
     }
     /// 范数列。
     pub fn norms(&self) -> &[f32] {
-        &self.norms
+        &self.core.norms
     }
     /// ID 列表。
     pub fn ids(&self) -> &[ExternalId] {
-        &self.ids
+        &self.core.ids
     }
     /// 维度。
     pub fn dim(&self) -> usize {
-        self.dim
+        self.core.dim
     }
     /// payload 覆盖层快照（压实时带入新段）。
     pub fn overlay_snapshot(&self) -> HashMap<ExternalId, Option<Value>> {

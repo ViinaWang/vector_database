@@ -4,6 +4,7 @@
 //! 不可变段上的删除/payload 更新走小的可重写边车（dels.bin / payloads.overlay.jsonl），
 //! 大文件永不重写; [`crate::engine`] 的 compact 负责最终合并。
 
+pub mod core;
 pub mod immutable;
 pub mod mutable;
 

@@ -29,5 +29,9 @@ harness = false
 name = "flat"
 harness = false
 
+[[bench]]
+name = "hnsw"
+harness = false
+
 [lints]
 workspace = true

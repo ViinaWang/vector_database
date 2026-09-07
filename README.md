@@ -9,16 +9,20 @@
 
 - 集合（固定维度 + 距离度量 L2/Cosine/Dot）+ JSON payload
 - CRUD: upsert / get / delete / scroll 分页 / payload 覆盖与清空
-- 精确最近邻检索（SIMD 友好的暴力扫描），过滤在算距离**之前**应用，无召回损失
+- 检索: HNSW 近似索引（不可变段，墓碑过滤在图遍历内生效）+ 精确扫描（可变段与对照）
 - 过滤条件: 字段相等/数组包含、数值范围、存在性、AND/OR/NOT、ID 集合
 - 持久化: WAL 先行写、不可变段 + manifest 原子切换、崩溃后自动恢复（尾部损坏自动截断）
-- compact: 合并段、清墓碑、固化 payload 覆盖层
+- compact: 合并段、清墓碑、固化 payload 覆盖层; 墓碑超 30% 的段自动单段重建
 - 三种接入: Rust 库 / REST 服务 / wasm（内存模式）
+
+检索质量与代价（10k 均匀随机数据，recall@10，默认参数）:
+128 维 ≈ 0.99，768 维 ≈ 0.93–0.96; ef_search 可调，完整矩阵见
+`crates/core/src/index/hnsw/params.rs`。真实嵌入数据（有簇结构）显著更好。
 
 ## 现在没有什么（不做的都写在计划里）
 
-HNSW 近似索引、量化、混合检索/全文、分布式、多租户、RBAC、GPU。
-这是刻意的——先把嵌入式 CRUD 与持久化语义做扎实。
+量化、混合检索/全文、字段倒排索引、分布式、多租户、RBAC、GPU。
+这是刻意的——先把嵌入式 CRUD、持久化与 ANN 语义做扎实。
 
 ## Quick start
 
@@ -77,6 +81,7 @@ data/
   segments/seg-N/          # 不可变段: vectors.bin / norms.bin / ids.jsonl / payloads.jsonl
     dels.bin               # 删除墓碑（roaring bitmap，可重写边车）
     payloads.overlay.jsonl # payload 覆盖层（可重写边车）
+    index.bin              # HNSW 图（按需）
 ```
 
 设计决策见 `docs/adr/`。

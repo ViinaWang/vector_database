@@ -57,12 +57,13 @@ pub fn search(
     };
 
     let mut heap: BinaryHeap<Reverse<HeapKey>> = BinaryHeap::new();
+    let q_norm = kernel::norm(query);
     for idx in 0..n as u32 {
         if pass.map(|p| !p(idx)).unwrap_or(false) {
             continue;
         }
         let v = &vectors[idx as usize * dim..(idx as usize + 1) * dim];
-        let raw = kernel::score(metric, query, v, norms[idx as usize]);
+        let raw = kernel::score_with(metric, query, q_norm, v, norms[idx as usize]);
         if raw.is_nan() {
             continue;
         }

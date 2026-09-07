@@ -24,11 +24,12 @@ pub mod segment;
 pub mod storage;
 pub mod wal;
 
-pub use collection::CollectionConfig;
+pub use collection::{CollectionConfig, IndexKind};
 pub use engine::{Collection, Database, DatabaseOptions};
 pub use error::{Error, Result};
 pub use filter::{Condition, FieldOp};
 pub use id::ExternalId;
+pub use index::hnsw::params::HnswParams;
 pub use kernel::Metric;
 pub use query::{Query, ScoredPoint, ScrollPage};
 pub use segment::Point;
