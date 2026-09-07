@@ -1,0 +1,16 @@
+[package]
+name = "vectordb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "REST server for vectordb-core"
+
+[dependencies]
+vectordb-core = { path = "../core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
