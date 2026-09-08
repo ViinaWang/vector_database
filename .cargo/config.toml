@@ -1,0 +1,4 @@
+# wasm 产物统一启用 SIMD128（crates/core kernel 的 wasm32 特化路径）。
+# 运行时要求: Chrome 91+ / Firefox 89+ / Safari 16.4+ / Node 16+。
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

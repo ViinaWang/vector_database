@@ -5,9 +5,10 @@
 //! - [`Metric::Dot`] — 返回内积，越大越好
 //! - [`Metric::Cosine`] — 返回归一化相似度，越大越好，范围 [-1, 1]
 //!
-//! x86_64 上运行时检测 AVX2+FMA 并走特化实现，其余平台用标量分块
-//! （依赖自动向量化）。两种实现的求和顺序不同，结果允许 ulp 级差异;
-//! 正确性由本文件的朴素参照测试与 benches/kernel.rs 共同守护。
+//! x86_64 上运行时检测 AVX2+FMA 走特化实现; wasm32 在构建期启用 SIMD128
+//! 时走 wasm128 特化（无运行时检测）; 其余平台用标量分块（依赖自动向量化）。
+//! 各实现的求和顺序不同，结果允许 ulp 级差异; 正确性由本文件的朴素参照
+//! 测试与 benches/kernel.rs 共同守护。
 
 // ADR 0003: 距离内核是允许 unsafe 的热路径模块，每处 unsafe 附 SAFETY 注释。
 #![allow(unsafe_code)]
@@ -53,7 +54,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { dot_avx2(a, b) };
         }
     }
-    dot_scalar(a, b)
+    dot_impl(a, b)
 }
 
 /// 平方欧氏距离。
@@ -66,6 +67,25 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { l2_sq_avx2(a, b) };
         }
     }
+    l2_sq_impl(a, b)
+}
+
+// 非 x86_64 的平台分发: wasm32 在构建期启用 simd128 时走特化（无运行时检测，
+// 由 .cargo/config.toml 统一开 +simd128），其余走标量。
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn dot_impl(a: &[f32], b: &[f32]) -> f32 {
+    dot_simd128(a, b)
+}
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+fn dot_impl(a: &[f32], b: &[f32]) -> f32 {
+    dot_scalar(a, b)
+}
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn l2_sq_impl(a: &[f32], b: &[f32]) -> f32 {
+    l2_sq_simd128(a, b)
+}
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+fn l2_sq_impl(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_scalar(a, b)
 }
 
@@ -97,6 +117,10 @@ pub fn score_with(metric: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f32
 
 // ---------------------------------------------------------------- 标量实现
 
+#[cfg_attr(
+    all(target_arch = "wasm32", target_feature = "simd128"),
+    allow(dead_code)
+)]
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     // 8 组独立累加器，固定 4 元素内层循环，给 LLVM 足够的向量化空间。
     const UNROLL: usize = 8;
@@ -122,6 +146,10 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+#[cfg_attr(
+    all(target_arch = "wasm32", target_feature = "simd128"),
+    allow(dead_code)
+)]
 fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
     const UNROLL: usize = 8;
     const LANE: usize = 4;
@@ -318,5 +346,94 @@ mod tests {
         let a = vec![1.0f32, 2.0];
         let z = vec![0.0f32, 0.0];
         assert_eq!(score(Metric::Cosine, &a, &z, norm(&z)), 0.0);
+    }
+}
+
+// ---------------------------------------------------------------- wasm32 SIMD128 实现
+// SIMD128 是编译期 target feature（wasm 无运行时特性检测），由工作区
+// .cargo/config.toml 统一启用 +simd128。产物要求支持 SIMD128 的运行时:
+// Chrome 91+ / Firefox 89+ / Safari 16.4+ / Node 16+。
+// 向量装载用 f32x4 构造器（4 次标量装载，编译器合并），
+// 避免 v128_load 的 16 字节对齐要求（Vec<f32> 只保证 4 字节对齐）。
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn dot_simd128(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::wasm32::*;
+    debug_assert_eq!(a.len(), b.len());
+    // wasm32 的 SIMD128 内在函数本身是安全的（target feature 编译期已启用）。
+    {
+        let n = a.len() / 4 * 4;
+        let mut acc = [f32x4_splat(0.0); 8];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, acc_j) in acc.iter_mut().enumerate() {
+                let k = i + j * 4;
+                let va = f32x4(a[k], a[k + 1], a[k + 2], a[k + 3]);
+                let vb = f32x4(b[k], b[k + 1], b[k + 2], b[k + 3]);
+                *acc_j = f32x4_add(*acc_j, f32x4_mul(va, vb));
+            }
+            i += 32;
+        }
+        while i + 4 <= n {
+            let va = f32x4(a[i], a[i + 1], a[i + 2], a[i + 3]);
+            let vb = f32x4(b[i], b[i + 1], b[i + 2], b[i + 3]);
+            acc[0] = f32x4_add(acc[0], f32x4_mul(va, vb));
+            i += 4;
+        }
+        let mut s = acc[0];
+        for &x in &acc[1..] {
+            s = f32x4_add(s, x);
+        }
+        let mut sum = f32x4_extract_lane::<0>(s)
+            + f32x4_extract_lane::<1>(s)
+            + f32x4_extract_lane::<2>(s)
+            + f32x4_extract_lane::<3>(s);
+        while i < a.len() {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn l2_sq_simd128(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::wasm32::*;
+    debug_assert_eq!(a.len(), b.len());
+    {
+        let n = a.len() / 4 * 4;
+        let mut acc = [f32x4_splat(0.0); 8];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, acc_j) in acc.iter_mut().enumerate() {
+                let k = i + j * 4;
+                let va = f32x4(a[k], a[k + 1], a[k + 2], a[k + 3]);
+                let vb = f32x4(b[k], b[k + 1], b[k + 2], b[k + 3]);
+                let d = f32x4_sub(va, vb);
+                *acc_j = f32x4_add(*acc_j, f32x4_mul(d, d));
+            }
+            i += 32;
+        }
+        while i + 4 <= n {
+            let va = f32x4(a[i], a[i + 1], a[i + 2], a[i + 3]);
+            let vb = f32x4(b[i], b[i + 1], b[i + 2], b[i + 3]);
+            let d = f32x4_sub(va, vb);
+            acc[0] = f32x4_add(acc[0], f32x4_mul(d, d));
+            i += 4;
+        }
+        let mut s = acc[0];
+        for &x in &acc[1..] {
+            s = f32x4_add(s, x);
+        }
+        let mut sum = f32x4_extract_lane::<0>(s)
+            + f32x4_extract_lane::<1>(s)
+            + f32x4_extract_lane::<2>(s)
+            + f32x4_extract_lane::<3>(s);
+        while i < a.len() {
+            let d = a[i] - b[i];
+            sum += d * d;
+            i += 1;
+        }
+        sum
     }
 }
