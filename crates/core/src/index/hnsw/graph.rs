@@ -137,6 +137,7 @@ impl HnswGraph {
 
         let query = data.vector(idx);
         let mut eps = vec![self.entry];
+        let mut scratch = traversal::Scratch::new();
 
         // 高层贪心下钻到 level+1。
         let mut cur = self.max_level;
@@ -162,7 +163,15 @@ impl HnswGraph {
                     data,
                     metric,
                 };
-                traversal::search_layer(&ctx, query, &eps, params.ef_construct.max(1), cur, None)
+                traversal::search_layer(
+                    &ctx,
+                    query,
+                    &eps,
+                    params.ef_construct.max(1),
+                    cur,
+                    None,
+                    &mut scratch,
+                )
             };
             let m_max = params.max_links(cur);
             let selected = {

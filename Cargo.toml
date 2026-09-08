@@ -15,7 +15,8 @@ repository = "https://github.com/example/vectordb"
 rust-version = "1.85"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# forbid 无法被局部 allow; 热路径模块（kernel）按 ADR 0003 以模块级 allow 开洞并附 SAFETY 注释
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]

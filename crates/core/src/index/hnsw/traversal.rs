@@ -6,8 +6,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use roaring::RoaringBitmap;
-
 use crate::kernel::{self, Metric};
 use crate::segment::core::SegmentCore;
 
@@ -111,6 +109,51 @@ pub(crate) fn greedy_descend(ctx: &Ctx<'_>, query: &[f32], ep: &mut u32, level: 
     }
 }
 
+/// 遍历 scratch: 访问位图与两个堆跨调用复用，消除每查询/每插入层的分配。
+pub(crate) struct Scratch {
+    visited: Vec<u64>,
+    cand: BinaryHeap<Reverse<Kf>>,
+    res: BinaryHeap<Kf>,
+}
+
+impl Scratch {
+    /// 新建（首次使用前需 reset）。
+    pub(crate) fn new() -> Self {
+        Scratch {
+            visited: Vec::new(),
+            cand: BinaryHeap::new(),
+            res: BinaryHeap::new(),
+        }
+    }
+
+    /// 按节点总数复位（清位图与堆，保留容量）。
+    pub(crate) fn reset(&mut self, count: u32) {
+        let words = (count as usize).div_ceil(64);
+        self.visited.clear();
+        self.visited.resize(words, 0);
+        self.cand.clear();
+        self.res.clear();
+    }
+
+    #[inline]
+    fn was_visited(&self, idx: u32) -> bool {
+        let i = idx as usize;
+        self.visited[i / 64] & (1u64 << (i % 64)) != 0
+    }
+
+    #[inline]
+    fn mark_visited(&mut self, idx: u32) {
+        let i = idx as usize;
+        self.visited[i / 64] |= 1u64 << (i % 64);
+    }
+}
+
+impl Default for Scratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 层内 best-first 搜索，返回至多 ef 个最近节点（key 升序）。
 /// 过滤版: `pass` 为 false 的节点不进结果，但仍参与图遍历（连通性）。
 pub(crate) fn search_layer(
@@ -120,50 +163,48 @@ pub(crate) fn search_layer(
     ef: usize,
     level: i32,
     pass: Option<&dyn Fn(u32) -> bool>,
+    scratch: &mut Scratch,
 ) -> Vec<(u32, f32)> {
     if ef == 0 || eps.is_empty() {
         return Vec::new();
     }
     let q_norm = kernel::norm(query);
-    let mut visited = RoaringBitmap::new();
-    // 候选小根堆（最近优先）。
-    let mut candidates: BinaryHeap<Reverse<Kf>> = BinaryHeap::new();
-    // 结果大根堆（堆顶是最差留存者），仅收 pass 通过的节点。
-    let mut results: BinaryHeap<Kf> = BinaryHeap::new();
+    scratch.reset(ctx.graph.count);
 
     for &ep in eps {
-        if visited.insert(ep) {
+        if !scratch.was_visited(ep) {
+            scratch.mark_visited(ep);
             let d = q_key(ctx, query, q_norm, ep);
             if pass.is_none_or(|p| p(ep)) {
-                push_result(&mut results, d, ep, ef);
+                push_result(&mut scratch.res, d, ep, ef);
             }
-            candidates.push(Reverse(Kf(d, ep)));
+            scratch.cand.push(Reverse(Kf(d, ep)));
         }
     }
 
-    while let Some(Reverse(node)) = candidates.pop() {
+    while let Some(Reverse(node)) = scratch.cand.pop() {
         let d = node.key();
-        if results.len() == ef && d > results.peek().map(|r| r.key()).unwrap_or(f32::MAX) {
+        if scratch.res.len() == ef && d > scratch.res.peek().map(|r| r.key()).unwrap_or(f32::MAX) {
             break;
         }
         for &nbr in ctx.graph.links(node.1, level) {
-            if nbr == EMPTY || visited.contains(nbr) {
+            if nbr == EMPTY || scratch.was_visited(nbr) {
                 continue;
             }
-            visited.insert(nbr);
+            scratch.mark_visited(nbr);
             let nd = q_key(ctx, query, q_norm, nbr);
-            let full = results.len() == ef;
-            let worst = results.peek().map(|r| r.key()).unwrap_or(f32::MAX);
+            let full = scratch.res.len() == ef;
+            let worst = scratch.res.peek().map(|r| r.key()).unwrap_or(f32::MAX);
             if !full || nd < worst {
-                candidates.push(Reverse(Kf(nd, nbr)));
+                scratch.cand.push(Reverse(Kf(nd, nbr)));
                 if pass.is_none_or(|p| p(nbr)) {
-                    push_result(&mut results, nd, nbr, ef);
+                    push_result(&mut scratch.res, nd, nbr, ef);
                 }
             }
         }
     }
 
-    let mut out: Vec<(u32, f32)> = results.into_iter().map(|k| (k.1, k.key())).collect();
+    let mut out: Vec<(u32, f32)> = scratch.res.drain().map(|k| (k.1, k.key())).collect();
     out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     out
 }

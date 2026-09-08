@@ -198,14 +198,15 @@ impl HnswIndex {
         for l in (1..=self.graph.max_level).rev() {
             traversal::greedy_descend(&ctx, query, &mut ep, l);
         }
+        let mut scratch = traversal::Scratch::new();
 
         let cap = self.params.ef_search.max(k).max(self.graph.count as usize);
         let mut ef = self.params.ef_search.max(k);
-        let mut results = traversal::search_layer(&ctx, query, &[ep], ef, 0, pass);
+        let mut results = traversal::search_layer(&ctx, query, &[ep], ef, 0, pass, &mut scratch);
         let mut tries = 0;
         while results.len() < k && ef < cap && tries < 3 {
             ef = (ef * 2).min(cap);
-            results = traversal::search_layer(&ctx, query, &[ep], ef, 0, pass);
+            results = traversal::search_layer(&ctx, query, &[ep], ef, 0, pass, &mut scratch);
             tries += 1;
         }
 

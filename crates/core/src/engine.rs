@@ -31,6 +31,7 @@ use crate::wal::{Op, Wal, WalRecord};
 
 const SEGMENTS_DIR: &str = "segments";
 const WAL_FILE: &str = "wal.log";
+#[cfg(not(target_arch = "wasm32"))]
 const LOCK_FILE: &str = "vectordb.lock";
 
 /// 数据库级选项。
@@ -610,6 +611,7 @@ impl DbInner {
     }
 }
 
+// wasm 上 Database::open 不编译，目录锁与其常量一并只在 native 存在。
 #[cfg(not(target_arch = "wasm32"))]
 fn lock_directory(root: &Path) -> Result<Option<std::fs::File>> {
     use fs4::fs_std::FileExt;
@@ -624,11 +626,6 @@ fn lock_directory(root: &Path) -> Result<Option<std::fs::File>> {
         Ok(false) => Err(Error::AlreadyOpen(root.display().to_string())),
         Err(e) => Err(Error::AlreadyOpen(format!("{}: {e}", root.display()))),
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn lock_directory(_root: &Path) -> Result<Option<std::fs::File>> {
-    Ok(None)
 }
 
 fn create_collection_locked(db: &Arc<DbInner>, name: &str, config: CollectionConfig) -> Result<()> {
