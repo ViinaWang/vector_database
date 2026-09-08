@@ -12,10 +12,13 @@ use std::sync::Arc;
 use vdb::{CollectionConfig, Condition, Database, ExternalId, Metric, Point, Query};
 use vectordb_core as vdb;
 
+/// 路由共享的应用状态。
 pub struct AppState {
+    /// 数据库句柄。
     pub db: Database,
 }
 
+/// 构建全部 REST 端点的路由（无监听、无生命周期任务，可自由组合）。
 pub fn router(db: Database) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
