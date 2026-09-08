@@ -37,6 +37,7 @@ pub fn router(db: Database) -> Router {
         .route("/collections/{name}/query", post(query))
         .route("/collections/{name}/payload:set", post(set_payload))
         .route("/collections/{name}/payload:clear", post(clear_payload))
+        .route("/collections/{name}/compact", post(compact_collection))
         .route("/flush", post(flush))
         .with_state(Arc::new(AppState { db }))
 }
@@ -75,6 +76,7 @@ struct CreateCollReq {
     name: String,
     dim: usize,
     metric: Option<String>,
+    index: Option<vdb::IndexKind>,
 }
 
 #[derive(Serialize)]
@@ -82,6 +84,7 @@ struct CollInfo {
     name: String,
     dim: usize,
     metric: String,
+    index: String,
     points: u64,
 }
 
@@ -133,6 +136,14 @@ fn parse_metric(s: &str) -> ApiResult<Metric> {
     }
 }
 
+// IndexKind 无 Display，match 成稳定字符串供展示
+fn index_kind_name(kind: &vdb::IndexKind) -> &'static str {
+    match kind {
+        vdb::IndexKind::Flat => "flat",
+        vdb::IndexKind::Hnsw { .. } => "hnsw",
+    }
+}
+
 fn parse_id(v: &Value) -> ApiResult<ExternalId> {
     match v {
         Value::Number(n) => n
@@ -170,12 +181,13 @@ async fn create_collection(
     Json(req): Json<CreateCollReq>,
 ) -> ApiResult<Json<CollInfo>> {
     let metric = parse_metric(req.metric.as_deref().unwrap_or("cosine"))?;
-    let c =
-        s.db.create_collection(&req.name, CollectionConfig::new(req.dim, metric)?)?;
+    let config = CollectionConfig::new(req.dim, metric)?.with_index(req.index.unwrap_or_default());
+    let c = s.db.create_collection(&req.name, config)?;
     Ok(Json(CollInfo {
         name: c.name().into(),
         dim: c.config().dim,
         metric: format!("{:?}", c.config().metric).to_lowercase(),
+        index: index_kind_name(&c.config().index).into(),
         points: 0,
     }))
 }
@@ -189,6 +201,7 @@ async fn collection_info(
         name: name.clone(),
         dim: c.config().dim,
         metric: format!("{:?}", c.config().metric).to_lowercase(),
+        index: index_kind_name(&c.config().index).into(),
         points: c.count(),
     }))
 }
@@ -304,4 +317,13 @@ async fn clear_payload(
 async fn flush(State(s): State<Arc<AppState>>) -> ApiResult<StatusCode> {
     s.db.flush()?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn compact_collection(
+    State(s): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let c = coll_of(&s.db, &name)?;
+    c.compact()?;
+    Ok(Json(serde_json::json!({ "compacted": true })))
 }
