@@ -1021,6 +1021,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
  "vectordb-core",
 ]
 
@@ -1043,9 +1044,12 @@ name = "vectordb-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http-body-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
  "vectordb-core",
 ]
 

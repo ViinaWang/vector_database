@@ -3,9 +3,8 @@
 // 入口处失败直接退出比传播错误更合适。
 #![allow(clippy::expect_used)]
 
-mod api;
-
 use vectordb_core::Database;
+use vectordb_server::api;
 
 fn main() {
     let path = std::env::var("VDB_PATH").unwrap_or_else(|_| "./data".into());
