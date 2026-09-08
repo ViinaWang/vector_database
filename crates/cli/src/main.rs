@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, Write};
-use vdb::{CollectionConfig, Database, ExternalId, Metric, Point, Query};
+use vdb::{CollectionConfig, Database, ExternalId, HnswParams, IndexKind, Metric, Point, Query};
 use vectordb_core as vdb;
 
 #[derive(Parser)]
@@ -28,6 +28,9 @@ enum Cmd {
         dim: usize,
         #[arg(long, default_value = "cosine")]
         metric: String,
+        /// 索引种类 flat|hnsw
+        #[arg(long, default_value = "hnsw")]
+        index: String,
     },
     /// 删集合
     Drop { name: String },
@@ -72,6 +75,24 @@ fn parse_metric(s: &str) -> Result<Metric, String> {
     }
 }
 
+fn parse_index(s: &str) -> Result<IndexKind, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "flat" => Ok(IndexKind::Flat),
+        "hnsw" => Ok(IndexKind::Hnsw {
+            params: HnswParams::default(),
+        }),
+        other => Err(format!("unknown index {other:?}, expected flat|hnsw")),
+    }
+}
+
+// IndexKind 无 Display，match 成稳定字符串供展示
+fn index_kind_name(kind: &IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Flat => "flat",
+        IndexKind::Hnsw { .. } => "hnsw",
+    }
+}
+
 // "123" → Num，"abc" → Str，"\"abc\"" → Str(abc)
 fn parse_id(s: &str) -> ExternalId {
     if let Ok(n) = s.parse::<i64>() {
@@ -92,17 +113,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for name in db.collections() {
                 let c = db.collection(&name).ok_or("collection vanished")?;
                 println!(
-                    "{}  dim={} metric={:?} points={}",
+                    "{}  dim={} metric={:?} index={} points={}",
                     c.name(),
                     c.config().dim,
                     c.config().metric,
+                    index_kind_name(&c.config().index),
                     c.count()
                 );
             }
         }
-        Cmd::Create { name, dim, metric } => {
+        Cmd::Create {
+            name,
+            dim,
+            metric,
+            index,
+        } => {
             let metric = parse_metric(&metric)?;
-            db.create_collection(&name, CollectionConfig::new(dim, metric)?)?;
+            let index = parse_index(&index)?;
+            db.create_collection(&name, CollectionConfig::new(dim, metric)?.with_index(index))?;
             println!("created {name}");
         }
         Cmd::Drop { name } => {
