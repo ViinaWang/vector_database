@@ -170,4 +170,73 @@ impl WasmDatabase {
             .ok_or_else(|| js(vdb::Error::CollectionNotFound(coll.into())))?;
         Ok(c.count())
     }
+
+    /// 清空这些点的 payload，返回命中数。
+    pub fn clear_payload(&self, coll: &str, ids_json: &str) -> Result<usize, JsError> {
+        let c = self
+            .db
+            .collection(coll)
+            .ok_or_else(|| js(vdb::Error::CollectionNotFound(coll.into())))?;
+        c.clear_payload(&parse_ids(ids_json)?).map_err(js)
+    }
+
+    /// 删除集合（含全部数据）。集合不存在时报错。
+    pub fn drop_collection(&self, name: &str) -> Result<(), JsError> {
+        self.db.drop_collection(name).map_err(js)
+    }
+
+    /// 把集合所有段合并为一个新段（清墓碑、固化覆盖层）。
+    pub fn compact(&self, coll: &str) -> Result<(), JsError> {
+        let c = self
+            .db
+            .collection(coll)
+            .ok_or_else(|| js(vdb::Error::CollectionNotFound(coll.into())))?;
+        c.compact().map_err(js)
+    }
+
+    /// 全量导出为 JSONL（每行一个 Point 的紧凑 JSON）。
+    /// 内部分页 scroll，浏览器端可把结果写入 OPFS/下载持久化。
+    pub fn export(&self, coll: &str) -> Result<String, JsError> {
+        let c = self
+            .db
+            .collection(coll)
+            .ok_or_else(|| js(vdb::Error::CollectionNotFound(coll.into())))?;
+        let mut out = String::new();
+        let mut offset = 0u64;
+        loop {
+            let page = c.scroll(offset, 1000, None).map_err(js)?;
+            for p in &page.points {
+                let line =
+                    serde_json::to_string(p).map_err(|e| js(vdb::Error::Serde(e.to_string())))?;
+                out.push_str(&line);
+                out.push('\n');
+            }
+            match page.next_offset {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// 集合元信息，返回 `{"name":..., "dim":..., "metric":"l2|cosine|dot", "points":N}`。
+    pub fn collection_info(&self, coll: &str) -> Result<String, JsError> {
+        let c = self
+            .db
+            .collection(coll)
+            .ok_or_else(|| js(vdb::Error::CollectionNotFound(coll.into())))?;
+        let cfg = c.config();
+        let metric = match cfg.metric {
+            Metric::L2 => "l2",
+            Metric::Cosine => "cosine",
+            Metric::Dot => "dot",
+        };
+        serde_json::to_string(&serde_json::json!({
+            "name": c.name(),
+            "dim": cfg.dim,
+            "metric": metric,
+            "points": c.count(),
+        }))
+        .map_err(|e| js(vdb::Error::Serde(e.to_string())))
+    }
 }
