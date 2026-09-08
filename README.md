@@ -67,7 +67,7 @@ vectordb-cli --path ./data query docs --vector 0.1,0.2,... --top-k 5
 | 形态 | 状态 |
 |---|---|
 | Linux / macOS / Windows（x86_64, aarch64） | 支持，CI 矩阵覆盖 |
-| wasm32（Node / 浏览器） | 内存模式可用（`Database::open_memory` / `vectordb-wasm`）|
+| wasm32（Node / 浏览器） | 内存模式可用（`Database::open_memory` / `vectordb-wasm`）; 距离内核走 SIMD128，产物要求 Chrome 91+ / Firefox 89+ / Safari 16.4+ / Node 16+ |
 | 浏览器持久化（OPFS + Worker） | 计划中 |
 
 wasm 当前为纯内存库: 数据生命周期 = 实例生命周期，持久化用 scroll 导出 / upsert 导回。
